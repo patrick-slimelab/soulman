@@ -78,7 +78,7 @@ public class SyncClient
         var destination = !string.IsNullOrWhiteSpace(settings.SyncRootPath)
             ? settings.SyncRootPath
             : settings.DestinationPath;
-        if (string.IsNullOrEmpty(destination)) return;
+        if (string.IsNullOrEmpty(destination) && string.IsNullOrEmpty(settings.MovieDestinationPath) && string.IsNullOrEmpty(settings.TvDestinationPath)) return;
 
         int syncedCount = 0;
         TcpClient? transferClient = null;
@@ -91,7 +91,7 @@ public class SyncClient
             {
                 if (token.IsCancellationRequested) break;
 
-                var localPath = Path.Combine(destination, file.Path);
+                var localPath = ResolveLocalPath(settings, destination, file.Path);
                 if (File.Exists(localPath))
                 {
                     _logger.LogDebug("Skipping existing file {Path}", file.Path);
@@ -175,7 +175,12 @@ public class SyncClient
 
             if (syncedCount > 0)
             {
-                _moveBroker.Publish(syncedCount, destination);
+                var notifyTarget = settings.SyncRootPath
+                    ?? settings.DestinationPath
+                    ?? settings.MovieDestinationPath
+                    ?? settings.TvDestinationPath
+                    ?? "<unset>";
+                _moveBroker.Publish(syncedCount, notifyTarget);
             }
         }
         finally
@@ -248,6 +253,46 @@ public class SyncClient
             if (File.Exists(tempPath)) File.Delete(tempPath);
             throw;
         }
+    }
+
+    private static string ResolveLocalPath(SoulmanSettings settings, string? legacyDestination, string remotePath)
+    {
+        var normalized = remotePath.Replace('\\', '/').TrimStart('/');
+
+        // If SyncRootPath is configured, preserve legacy single-root behavior
+        if (!string.IsNullOrWhiteSpace(settings.SyncRootPath))
+        {
+            return Path.Combine(settings.SyncRootPath!, normalized);
+        }
+
+        var slash = normalized.IndexOf('/');
+        if (slash > 0)
+        {
+            var prefix = normalized[..slash];
+            var rest = normalized[(slash + 1)..];
+
+            if (string.Equals(prefix, "Music", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(settings.DestinationPath))
+                return Path.Combine(settings.DestinationPath!, rest);
+
+            if (string.Equals(prefix, "Movies", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(settings.MovieDestinationPath))
+                return Path.Combine(settings.MovieDestinationPath!, rest);
+
+            if (string.Equals(prefix, "TV", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(settings.TvDestinationPath))
+                return Path.Combine(settings.TvDestinationPath!, rest);
+        }
+
+        if (!string.IsNullOrWhiteSpace(legacyDestination))
+        {
+            return Path.Combine(legacyDestination, normalized);
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.DestinationPath))
+        {
+            return Path.Combine(settings.DestinationPath!, normalized);
+        }
+
+        // Final fallback should be very rare
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), normalized);
     }
 
     private class RemoteFile

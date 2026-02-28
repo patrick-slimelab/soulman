@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
+using System.Linq;
 
 namespace Soulman;
 
@@ -136,21 +137,36 @@ public class SyncServer : IHostedService, IDisposable
     private async Task HandleList(StreamWriter writer)
     {
         var settings = _options.CurrentValue;
-        var root = GetSyncRoot(settings);
-        if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
+        var roots = GetSyncRoots(settings);
+        if (roots.Count == 0)
         {
             await writer.WriteLineAsync("[]");
             return;
         }
 
-        var files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
-            .Where(f => settings.IsSupportedFile(f))
-            .Select(f => new
+        var files = new List<object>();
+        foreach (var root in roots)
+        {
+            if (!Directory.Exists(root.Path))
             {
-                Path = Path.GetRelativePath(root, f).Replace('\\', '/'),
-                Size = new FileInfo(f).Length
-            })
-            .ToList();
+                continue;
+            }
+
+            foreach (var f in Directory.EnumerateFiles(root.Path, "*", SearchOption.AllDirectories)
+                         .Where(settings.IsSupportedFile))
+            {
+                var rel = Path.GetRelativePath(root.Path, f).Replace('\\', '/');
+                var publishPath = string.IsNullOrWhiteSpace(root.Prefix)
+                    ? rel
+                    : $"{root.Prefix}/{rel}";
+
+                files.Add(new
+                {
+                    Path = publishPath,
+                    Size = new FileInfo(f).Length
+                });
+            }
+        }
 
         var json = JsonSerializer.Serialize(files);
         await writer.WriteLineAsync(json);
@@ -158,8 +174,6 @@ public class SyncServer : IHostedService, IDisposable
 
     private async Task HandleGet(string relativePath, StreamWriter writer, NetworkStream stream)
     {
-        // Security check: Prevent directory traversal
-        // We rely primarily on the path anchoring check below, but we can do a quick check for explicit traversal sequences
         if (relativePath.Contains("../") || relativePath.Contains("..\\") || Path.IsPathRooted(relativePath))
         {
             await writer.WriteLineAsync("ERROR Invalid path");
@@ -167,16 +181,22 @@ public class SyncServer : IHostedService, IDisposable
         }
 
         var settings = _options.CurrentValue;
-        var root = GetSyncRoot(settings);
-        if (string.IsNullOrEmpty(root))
+        var roots = GetSyncRoots(settings);
+        if (roots.Count == 0)
         {
              await writer.WriteLineAsync("ERROR No library configured");
              return;
         }
 
-        var fullPath = Path.Combine(root, relativePath);
-        // Ensure the full path is actually within the root
-        if (!Path.GetFullPath(fullPath).StartsWith(Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase))
+        var (root, strippedRelativePath) = ResolveRootForRequestedPath(roots, relativePath);
+        if (root == null)
+        {
+            await writer.WriteLineAsync("ERROR No matching sync root");
+            return;
+        }
+
+        var fullPath = Path.Combine(root.Path, strippedRelativePath);
+        if (!Path.GetFullPath(fullPath).StartsWith(Path.GetFullPath(root.Path), StringComparison.OrdinalIgnoreCase))
         {
              await writer.WriteLineAsync("ERROR Access denied");
              return;
@@ -192,8 +212,6 @@ public class SyncServer : IHostedService, IDisposable
         var remoteLabel = stream.Socket?.RemoteEndPoint?.ToString() ?? "<unknown>";
         _logger.LogInformation("Serving {Path} ({Size} bytes) to {Remote}", relativePath, info.Length, remoteLabel);
         await writer.WriteLineAsync($"OK {info.Length}");
-        
-        // Important: Flush the writer buffer before writing raw bytes to the underlying stream
         await writer.FlushAsync();
 
         using var fileStream = File.OpenRead(fullPath);
@@ -210,13 +228,55 @@ public class SyncServer : IHostedService, IDisposable
         }
     }
 
-    private static string? GetSyncRoot(SoulmanSettings settings)
+    private static IReadOnlyList<SyncRoot> GetSyncRoots(SoulmanSettings settings)
     {
+        // Legacy single-root mode still supported
         if (!string.IsNullOrWhiteSpace(settings.SyncRootPath))
         {
-            return settings.SyncRootPath;
+            return new List<SyncRoot>
+            {
+                new(settings.SyncRootPath!, string.Empty)
+            };
         }
 
-        return settings.DestinationPath;
+        var roots = new List<SyncRoot>();
+
+        if (!string.IsNullOrWhiteSpace(settings.DestinationPath))
+            roots.Add(new SyncRoot(settings.DestinationPath!, "Music"));
+
+        if (!string.IsNullOrWhiteSpace(settings.MovieDestinationPath))
+            roots.Add(new SyncRoot(settings.MovieDestinationPath!, "Movies"));
+
+        if (!string.IsNullOrWhiteSpace(settings.TvDestinationPath))
+            roots.Add(new SyncRoot(settings.TvDestinationPath!, "TV"));
+
+        return roots
+            .Select(r => new SyncRoot(Path.GetFullPath(r.Path), r.Prefix))
+            .DistinctBy(r => r.Path)
+            .ToList();
     }
+
+    private static (SyncRoot? Root, string RelativePath) ResolveRootForRequestedPath(IReadOnlyList<SyncRoot> roots, string requestPath)
+    {
+        var normalized = requestPath.Replace('\\', '/').TrimStart('/');
+
+        // Multi-root format: Prefix/path/to/file
+        var slash = normalized.IndexOf('/');
+        if (slash > 0)
+        {
+            var prefix = normalized[..slash];
+            var rest = normalized[(slash + 1)..];
+            var match = roots.FirstOrDefault(r => string.Equals(r.Prefix, prefix, StringComparison.OrdinalIgnoreCase));
+            if (match != null)
+            {
+                return (match, rest);
+            }
+        }
+
+        // Legacy/single-root fallback
+        return (roots.FirstOrDefault(), normalized);
+    }
+
+    private sealed record SyncRoot(string Path, string Prefix);
 }
+
